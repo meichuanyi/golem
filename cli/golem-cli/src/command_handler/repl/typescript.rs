@@ -19,6 +19,7 @@ use crate::app::context::BuildContext;
 use crate::bridge_gen::bridge_client_directory_name;
 use crate::command_handler::Handlers;
 use crate::command_handler::repl::load_repl_metadata;
+use crate::command_handler::repl::supervisor::{ReplCommandSpec, run_repl_session};
 use crate::context::Context;
 use crate::log::{LogIndent, Output, log_action, log_skipping_up_to_date, logln, set_log_output};
 use crate::model::GuestLanguage;
@@ -51,6 +52,10 @@ impl TypeScriptRepl {
     }
 
     pub async fn run(&self, args: BridgeReplArgs) -> anyhow::Result<()> {
+        if args.script.is_none() && std::env::var_os("GOLEM_REPL_PTY").is_some() {
+            return self.run_with_pty_supervisor(args).await;
+        }
+
         {
             log_action("Preparing", "TypeScript REPL");
             let _indent = LogIndent::new();
@@ -70,6 +75,40 @@ impl TypeScriptRepl {
 
             if result.code() != Some(75) {
                 return result.check_exit_status();
+            }
+
+            {
+                logln("");
+                log_action("Reloading", "TypeScript REPL");
+                let _indent = LogIndent::new();
+                self.generate_repl_package(&args).await?;
+                logln("");
+            }
+        }
+    }
+
+    async fn run_with_pty_supervisor(&self, args: BridgeReplArgs) -> anyhow::Result<()> {
+        {
+            log_action("Preparing", "TypeScript REPL PTY prototype");
+            let _indent = LogIndent::new();
+
+            self.generate_repl_package(&args).await?;
+        }
+
+        logln("");
+
+        loop {
+            let command = self.prepare_command_spec(&args).await?;
+            let result = tokio::task::spawn_blocking(move || run_repl_session(command)).await??;
+
+            if result.exit.code != Some(75) {
+                if result.exit.success {
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "Command failed with exit code: {}",
+                    result.exit.code.unwrap_or(1)
+                );
             }
 
             {
@@ -376,6 +415,36 @@ impl TypeScriptRepl {
         }
 
         Ok(command)
+    }
+
+    async fn prepare_command_spec(&self, args: &BridgeReplArgs) -> anyhow::Result<ReplCommandSpec> {
+        let mut command_args = vec!["tsx".to_string(), "repl.ts".to_string()];
+
+        if args.disable_auto_imports {
+            command_args.push("--disable-auto-imports".to_string());
+        }
+        if !args.stream_logs {
+            command_args.push("--disable-stream".to_string());
+        }
+        if let Some(script) = &args.script {
+            match script {
+                ReplScriptSource::Inline(script) => {
+                    command_args.push("--script".to_string());
+                    command_args.push(script.clone());
+                }
+                ReplScriptSource::FromFile(path) => {
+                    command_args.push("--script-file".to_string());
+                    command_args.push(fs::path_to_str(path)?.to_string());
+                }
+            }
+        }
+
+        Ok(ReplCommandSpec {
+            program: which("npx")?,
+            args: command_args,
+            cwd: args.repl_root_dir.clone(),
+            env: self.ctx.repl_handler().repl_server_env_vars().await?,
+        })
     }
 }
 
