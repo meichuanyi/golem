@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::ReplCommandSpec;
+use super::{CommandExit, ReplCommandSpec};
 use anyhow::Context;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 pub struct PtyChild {
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
-    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
+    pub exit_receiver: Receiver<CommandExit>,
 }
 
 pub fn spawn_pty_command(spec: ReplCommandSpec) -> anyhow::Result<PtyChild> {
@@ -42,10 +45,11 @@ pub fn spawn_pty_command(spec: ReplCommandSpec) -> anyhow::Result<PtyChild> {
         command.env(key, value);
     }
 
-    let child = pair
+    let mut child = pair
         .slave
         .spawn_command(command)
         .context("Failed to spawn PTY command")?;
+    let killer = child.clone_killer();
     let reader = pair
         .master
         .try_clone_reader()
@@ -55,9 +59,21 @@ pub fn spawn_pty_command(spec: ReplCommandSpec) -> anyhow::Result<PtyChild> {
         .take_writer()
         .context("Failed to take PTY writer")?;
 
+    let (exit_tx, exit_rx) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok(status) = child.wait() {
+            let code = Some(status.exit_code() as i32);
+            let _ = exit_tx.send(CommandExit {
+                code,
+                success: code == Some(0),
+            });
+        }
+    });
+
     Ok(PtyChild {
         reader,
         writer,
-        child,
+        killer,
+        exit_receiver: exit_rx,
     })
 }

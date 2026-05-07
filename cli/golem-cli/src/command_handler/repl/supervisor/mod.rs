@@ -18,14 +18,20 @@ mod pty;
 use anyhow::{Context, anyhow};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub const REPL_CONTROL_ADDR_ENV: &str = "GOLEM_REPL_CONTROL_ADDR";
 pub const REPL_CONTROL_TOKEN_ENV: &str = "GOLEM_REPL_CONTROL_TOKEN";
+const GOLEM_REPL_PTY_DEBUG_ENV: &str = "GOLEM_REPL_PTY_DEBUG";
+const GOLEM_REPL_PTY_DEBUG_LOG_ENV: &str = "GOLEM_REPL_PTY_DEBUG_LOG";
+const STARTUP_STABILIZATION_DELAY: Duration = Duration::from_millis(200);
+const CLI_CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(1200);
 
 #[derive(Clone, Debug)]
 pub struct ReplCommandSpec {
@@ -58,97 +64,373 @@ pub fn run_repl_session(mut node_spec: ReplCommandSpec) -> anyhow::Result<ReplSe
         .env
         .insert(REPL_CONTROL_TOKEN_ENV.to_string(), token);
 
+    let debug_log = DebugLog::from_env();
+    debug_log.log(format!(
+        "starting REPL supervisor for {:?}",
+        node_spec.program
+    ));
+
     let terminal_guard = RawTerminalGuard::enter()?;
-    let result = run_repl_session_raw(node_spec, control);
+    let mut supervisor = Supervisor::new(control, debug_log);
+    let result = supervisor.run(node_spec);
     drop(terminal_guard);
     result
 }
 
-fn run_repl_session_raw(
-    node_spec: ReplCommandSpec,
-    control: control::ControlServer,
-) -> anyhow::Result<ReplSessionResult> {
-    let (event_tx, event_rx) = mpsc::channel::<SupervisorEvent>();
-    let mut node = pty::spawn_pty_command(node_spec)?;
-    let mut active = ActiveSession::Node;
-    let mut cli_writer: Option<Box<dyn Write + Send>> = None;
-    let mut pending_cli_response: Option<Sender<control::RunCliResponse>> = None;
+struct Supervisor {
+    control: Option<control::ControlServer>,
+    debug_log: DebugLog,
+    state: SupervisorState,
+    state_since: Instant,
+    terminal_state: TerminalState,
+    node: Option<SessionRuntime>,
+    cli: Option<SessionRuntime>,
+    pending_cli_response: Option<Sender<control::RunCliResponse>>,
+    cli_cancel_pending: bool,
+    ctrl_c_debounced: bool,
+}
 
-    spawn_input_reader(event_tx.clone());
-    spawn_pty_output_reader(SessionId::Node, node.reader, event_tx.clone());
-    spawn_waiter(SessionId::Node, node.child, event_tx.clone());
-    control.spawn_request_reader(event_tx.clone());
+impl Supervisor {
+    fn new(control: control::ControlServer, debug_log: DebugLog) -> Self {
+        Self {
+            control: Some(control),
+            debug_log,
+            state: SupervisorState::NodeStarting,
+            state_since: Instant::now(),
+            terminal_state: TerminalState::Raw,
+            node: None,
+            cli: None,
+            pending_cli_response: None,
+            cli_cancel_pending: false,
+            ctrl_c_debounced: false,
+        }
+    }
 
-    while let Ok(event) = event_rx.recv() {
-        match event {
-            SupervisorEvent::Input(bytes) => match active {
-                ActiveSession::Node => {
-                    let _ = node.writer.write_all(&bytes);
-                    let _ = node.writer.flush();
-                }
-                ActiveSession::Cli => {
-                    if let Some(writer) = cli_writer.as_mut() {
-                        let _ = writer.write_all(&bytes);
-                        let _ = writer.flush();
+    fn run(&mut self, node_spec: ReplCommandSpec) -> anyhow::Result<ReplSessionResult> {
+        let (event_tx, event_rx) = mpsc::channel::<SupervisorEvent>();
+        spawn_input_reader(event_tx.clone());
+        self.control
+            .take()
+            .expect("missing REPL control server")
+            .spawn_request_reader(event_tx.clone());
+
+        self.node = Some(self.spawn_session(SessionId::Node, node_spec, &event_tx)?);
+        self.set_state(SupervisorState::NodeStarting);
+
+        loop {
+            self.tick(&event_tx)?;
+
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => {
+                    if let Some(result) = self.handle_event(event, &event_tx)? {
+                        self.cleanup_all();
+                        return Ok(result);
                     }
                 }
-            },
-            SupervisorEvent::Output { session, bytes } => {
-                if active.accepts_output(session) {
-                    let mut stdout = std::io::stdout();
-                    stdout.write_all(&bytes)?;
-                    stdout.flush()?;
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.cleanup_all();
+                    return Err(anyhow!("REPL supervisor event loop stopped unexpectedly"));
                 }
-            }
-            SupervisorEvent::Exited { session, exit } => match session {
-                SessionId::Node => return Ok(ReplSessionResult { exit }),
-                SessionId::Cli => {
-                    active = ActiveSession::Node;
-                    cli_writer = None;
-                    if let Some(response) = pending_cli_response.take() {
-                        let _ = response.send(control::RunCliResponse {
-                            ok: exit.success,
-                            code: exit.code,
-                            stdout: None,
-                            stderr: None,
-                        });
-                    }
-                }
-            },
-            SupervisorEvent::RunCli(request) => {
-                if pending_cli_response.is_some() {
-                    let _ = request.response.send(control::RunCliResponse {
-                        ok: false,
-                        code: None,
-                        stdout: None,
-                        stderr: Some("another CLI command is already running".to_string()),
-                    });
-                    continue;
-                }
-
-                let cli = spawn_cli_command(request.args)?;
-                active = ActiveSession::Cli;
-                cli_writer = Some(cli.writer);
-                pending_cli_response = Some(request.response);
-                spawn_pty_output_reader(SessionId::Cli, cli.reader, event_tx.clone());
-                spawn_waiter(SessionId::Cli, cli.child, event_tx.clone());
             }
         }
     }
 
-    Err(anyhow!("REPL supervisor event loop stopped unexpectedly"))
+    fn handle_event(
+        &mut self,
+        event: SupervisorEvent,
+        event_tx: &Sender<SupervisorEvent>,
+    ) -> anyhow::Result<Option<ReplSessionResult>> {
+        match event {
+            SupervisorEvent::Input(bytes) => {
+                self.handle_input(bytes)?;
+                Ok(None)
+            }
+            SupervisorEvent::CtrlC => {
+                self.handle_ctrl_c()?;
+                Ok(None)
+            }
+            SupervisorEvent::Output { session, bytes } => {
+                self.handle_output(session, bytes);
+                Ok(None)
+            }
+            SupervisorEvent::Exited { session, exit } => self.handle_exit(session, exit),
+            SupervisorEvent::RunCli(request) => {
+                self.handle_run_cli(request, event_tx)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn handle_input(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let target = match self.state {
+            SupervisorState::ReplActive | SupervisorState::NodeStarting => self.node.as_mut(),
+            SupervisorState::CliStarting
+            | SupervisorState::CliActive
+            | SupervisorState::CliCancelling
+            | SupervisorState::CliExiting => self.cli.as_mut(),
+            SupervisorState::ShuttingDown => None,
+        };
+
+        if let Some(target) = target {
+            target.writer.write_all(&bytes)?;
+            target.writer.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_output(&mut self, session: SessionId, bytes: Vec<u8>) {
+        let should_write = match (self.state, session) {
+            (SupervisorState::ReplActive, SessionId::Node)
+            | (SupervisorState::NodeStarting, SessionId::Node)
+            | (SupervisorState::CliStarting, SessionId::Cli)
+            | (SupervisorState::CliActive, SessionId::Cli)
+            | (SupervisorState::CliCancelling, SessionId::Cli)
+            | (SupervisorState::CliExiting, SessionId::Cli) => true,
+            _ => false,
+        };
+
+        if should_write {
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(&bytes);
+            let _ = stdout.flush();
+        }
+
+        if matches!(self.state, SupervisorState::NodeStarting) && session == SessionId::Node {
+            self.set_state(SupervisorState::ReplActive);
+        }
+
+        if matches!(self.state, SupervisorState::CliStarting) && session == SessionId::Cli {
+            self.set_state(SupervisorState::CliActive);
+        }
+    }
+
+    fn handle_run_cli(
+        &mut self,
+        request: control::RunCliSupervisorRequest,
+        event_tx: &Sender<SupervisorEvent>,
+    ) -> anyhow::Result<()> {
+        if self.pending_cli_response.is_some() || !matches!(self.state, SupervisorState::ReplActive)
+        {
+            let _ = request.response.send(control::RunCliResponse {
+                ok: false,
+                code: None,
+                stdout: None,
+                stderr: Some("another CLI command is already running".to_string()),
+            });
+            return Ok(());
+        }
+
+        self.debug_log
+            .log(format!("runCli request: {:?}", request.args));
+        let cli = self.spawn_session(
+            SessionId::Cli,
+            ReplCommandSpec {
+                program: PathBuf::from(crate::binary_path_to_string()?),
+                args: request.args,
+                cwd: crate::fs::current_dir_lexical()?,
+                env: HashMap::new(),
+            },
+            event_tx,
+        )?;
+
+        self.cli = Some(cli);
+        self.pending_cli_response = Some(request.response);
+        self.cli_cancel_pending = false;
+        self.ctrl_c_debounced = false;
+        self.set_state(SupervisorState::CliStarting);
+        Ok(())
+    }
+
+    fn handle_ctrl_c(&mut self) -> anyhow::Result<()> {
+        self.debug_log
+            .log(format!("ctrl-c in state {:?}", self.state));
+
+        match self.state {
+            SupervisorState::ReplActive | SupervisorState::NodeStarting => {
+                if let Some(node) = self.node.as_mut() {
+                    node.writer.write_all(&[3])?;
+                    node.writer.flush()?;
+                }
+            }
+            SupervisorState::CliStarting | SupervisorState::CliActive => {
+                if !self.ctrl_c_debounced {
+                    self.request_cli_cancel()?;
+                }
+            }
+            SupervisorState::CliCancelling | SupervisorState::CliExiting => {
+                self.ctrl_c_debounced = true;
+            }
+            SupervisorState::ShuttingDown => {
+                self.ctrl_c_debounced = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn request_cli_cancel(&mut self) -> anyhow::Result<()> {
+        self.ctrl_c_debounced = true;
+        self.cli_cancel_pending = true;
+        self.set_state(SupervisorState::CliCancelling);
+        if let Some(cli) = self.cli.as_mut() {
+            self.debug_log.log("forwarding ctrl-c to CLI PTY");
+            cli.writer.write_all(&[3])?;
+            cli.writer.flush()?;
+            cli.cancel_deadline = Some(Instant::now() + CLI_CANCEL_GRACE_PERIOD);
+        }
+        Ok(())
+    }
+
+    fn handle_exit(
+        &mut self,
+        session: SessionId,
+        exit: CommandExit,
+    ) -> anyhow::Result<Option<ReplSessionResult>> {
+        self.debug_log.log(format!(
+            "session {:?} exited with {:?}",
+            session,
+            format_exit_code(exit.code)
+        ));
+
+        match session {
+            SessionId::Node => {
+                self.node = None;
+                self.set_state(SupervisorState::ShuttingDown);
+                Ok(Some(ReplSessionResult { exit }))
+            }
+            SessionId::Cli => {
+                self.cli = None;
+                self.cli_cancel_pending = false;
+                self.ctrl_c_debounced = false;
+                self.set_state(SupervisorState::CliExiting);
+
+                if let Some(response) = self.pending_cli_response.take() {
+                    let _ = response.send(control::RunCliResponse {
+                        ok: exit.success,
+                        code: exit.code,
+                        stdout: None,
+                        stderr: None,
+                    });
+                }
+
+                self.refresh_terminal_mode()?;
+                self.set_state(SupervisorState::ReplActive);
+                Ok(None)
+            }
+        }
+    }
+
+    fn tick(&mut self, _event_tx: &Sender<SupervisorEvent>) -> anyhow::Result<()> {
+        match self.state {
+            SupervisorState::NodeStarting => {
+                if self.state_since.elapsed() >= STARTUP_STABILIZATION_DELAY {
+                    self.set_state(SupervisorState::ReplActive);
+                }
+            }
+            SupervisorState::CliStarting => {
+                if self.state_since.elapsed() >= STARTUP_STABILIZATION_DELAY {
+                    if self.cli_cancel_pending {
+                        self.request_cli_cancel()?;
+                    } else {
+                        self.set_state(SupervisorState::CliActive);
+                    }
+                }
+            }
+            SupervisorState::CliCancelling => {
+                if let Some(deadline) = self.cli.as_ref().and_then(|cli| cli.cancel_deadline)
+                    && Instant::now() >= deadline
+                {
+                    self.debug_log
+                        .log("CLI cancel grace period elapsed, killing child");
+                    if let Some(cli) = self.cli.as_mut() {
+                        let _ = cli.kill();
+                        cli.cancel_deadline = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn spawn_session(
+        &mut self,
+        session: SessionId,
+        spec: ReplCommandSpec,
+        event_tx: &Sender<SupervisorEvent>,
+    ) -> anyhow::Result<SessionRuntime> {
+        self.debug_log.log(format!(
+            "spawning {:?}: program={:?} args={:?}",
+            session, spec.program, spec.args
+        ));
+        let child = pty::spawn_pty_command(spec)?;
+        spawn_pty_output_reader(session, child.reader, event_tx.clone());
+        spawn_waiter(session, child.exit_receiver, event_tx.clone());
+        Ok(SessionRuntime {
+            writer: child.writer,
+            killer: child.killer,
+            cancel_deadline: None,
+        })
+    }
+
+    fn refresh_terminal_mode(&mut self) -> anyhow::Result<()> {
+        if matches!(self.terminal_state, TerminalState::Raw) {
+            disable_raw_mode().context("Failed to disable terminal raw mode")?;
+            enable_raw_mode().context("Failed to re-enable terminal raw mode")?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_all(&mut self) {
+        self.debug_log.log("cleaning up PTY sessions");
+        self.set_state(SupervisorState::ShuttingDown);
+        if let Some(cli) = self.cli.as_mut() {
+            let _ = cli.kill();
+        }
+        if let Some(node) = self.node.as_mut() {
+            let _ = node.kill();
+        }
+    }
+
+    fn set_state(&mut self, state: SupervisorState) {
+        if self.state != state {
+            self.debug_log
+                .log(format!("state {:?} -> {:?}", self.state, state));
+            self.state = state;
+            self.state_since = Instant::now();
+        }
+    }
 }
 
-fn spawn_cli_command(args: Vec<String>) -> anyhow::Result<pty::PtyChild> {
-    let program = crate::binary_path_to_string()?.into();
-    let cwd = crate::fs::current_dir_lexical()?;
-    let spec = ReplCommandSpec {
-        program,
-        args,
-        cwd,
-        env: HashMap::new(),
-    };
-    pty::spawn_pty_command(spec)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisorState {
+    NodeStarting,
+    ReplActive,
+    CliStarting,
+    CliActive,
+    CliCancelling,
+    CliExiting,
+    ShuttingDown,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TerminalState {
+    Raw,
+}
+
+struct SessionRuntime {
+    writer: Box<dyn Write + Send>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    cancel_deadline: Option<Instant>,
+}
+
+impl SessionRuntime {
+    fn kill(&mut self) -> anyhow::Result<()> {
+        self.killer.kill().context("Failed to kill PTY child")
+    }
 }
 
 fn spawn_input_reader(event_tx: Sender<SupervisorEvent>) {
@@ -159,9 +441,20 @@ fn spawn_input_reader(event_tx: Sender<SupervisorEvent>) {
             match stdin.read(&mut buffer) {
                 Ok(0) => return,
                 Ok(n) => {
-                    if event_tx
-                        .send(SupervisorEvent::Input(buffer[..n].to_vec()))
-                        .is_err()
+                    if buffer[..n].contains(&3) {
+                        if event_tx.send(SupervisorEvent::CtrlC).is_err() {
+                            return;
+                        }
+                    }
+
+                    let filtered = buffer[..n]
+                        .iter()
+                        .copied()
+                        .filter(|byte| *byte != 3)
+                        .collect::<Vec<_>>();
+
+                    if !filtered.is_empty()
+                        && event_tx.send(SupervisorEvent::Input(filtered)).is_err()
                     {
                         return;
                     }
@@ -201,19 +494,12 @@ fn spawn_pty_output_reader(
 
 fn spawn_waiter(
     session: SessionId,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    exit_rx: Receiver<CommandExit>,
     event_tx: Sender<SupervisorEvent>,
 ) {
     thread::spawn(move || {
-        if let Ok(status) = child.wait() {
-            let code = Some(status.exit_code() as i32);
-            let _ = event_tx.send(SupervisorEvent::Exited {
-                session,
-                exit: CommandExit {
-                    code,
-                    success: code == Some(0),
-                },
-            });
+        if let Ok(exit) = exit_rx.recv() {
+            let _ = event_tx.send(SupervisorEvent::Exited { session, exit });
         }
     });
 }
@@ -224,23 +510,9 @@ enum SessionId {
     Cli,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActiveSession {
-    Node,
-    Cli,
-}
-
-impl ActiveSession {
-    fn accepts_output(self, session: SessionId) -> bool {
-        matches!(
-            (self, session),
-            (ActiveSession::Node, SessionId::Node) | (ActiveSession::Cli, SessionId::Cli)
-        )
-    }
-}
-
 enum SupervisorEvent {
     Input(Vec<u8>),
+    CtrlC,
     Output {
         session: SessionId,
         bytes: Vec<u8>,
@@ -264,5 +536,53 @@ impl RawTerminalGuard {
 impl Drop for RawTerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+    }
+}
+
+#[derive(Clone, Default)]
+struct DebugLog {
+    enabled: bool,
+    path: Option<PathBuf>,
+}
+
+impl DebugLog {
+    fn from_env() -> Self {
+        let enabled = std::env::var_os(GOLEM_REPL_PTY_DEBUG_ENV).is_some()
+            || std::env::var_os(GOLEM_REPL_PTY_DEBUG_LOG_ENV).is_some();
+        let path = std::env::var_os(GOLEM_REPL_PTY_DEBUG_LOG_ENV).map(PathBuf::from);
+        Self { enabled, path }
+    }
+
+    fn log(&self, message: impl AsRef<str>) {
+        if !self.enabled {
+            return;
+        }
+
+        let line = format!("[golem-repl-pty] {}\n", message.as_ref());
+        if let Some(path) = &self.path {
+            let _ = append_log_line(path, &line);
+        } else {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+}
+
+fn append_log_line(path: &Path, line: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn format_exit_code(code: Option<i32>) -> String {
+    match code {
+        Some(code) if code < 0 => format!("{code} ({:#010X})", code as u32),
+        Some(code) => code.to_string(),
+        None => "<unknown>".to_string(),
     }
 }

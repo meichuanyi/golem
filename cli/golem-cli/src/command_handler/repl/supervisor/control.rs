@@ -20,6 +20,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
+#[derive(Debug)]
 pub struct ControlServer {
     listener: TcpListener,
     addr: SocketAddr,
