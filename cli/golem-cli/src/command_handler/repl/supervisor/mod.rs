@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 pub const REPL_CONTROL_ADDR_ENV: &str = "GOLEM_REPL_CONTROL_ADDR";
@@ -52,7 +53,36 @@ pub struct CommandExit {
     pub success: bool,
 }
 
-pub fn run_repl_session(mut node_spec: ReplCommandSpec) -> anyhow::Result<ReplSessionResult> {
+pub struct ReloadCoordinator {
+    request_tx: tokio_mpsc::UnboundedSender<ReloadRequest>,
+}
+
+pub struct ReloadDriver {
+    pub request_rx: tokio_mpsc::UnboundedReceiver<ReloadRequest>,
+}
+
+pub struct ReloadRequest {
+    response_tx: Sender<Result<ReplCommandSpec, String>>,
+}
+
+impl ReloadRequest {
+    pub fn respond(self, response: Result<ReplCommandSpec, String>) {
+        let _ = self.response_tx.send(response);
+    }
+}
+
+pub fn reload_channel() -> (ReloadCoordinator, ReloadDriver) {
+    let (request_tx, request_rx) = tokio_mpsc::unbounded_channel();
+    (
+        ReloadCoordinator { request_tx },
+        ReloadDriver { request_rx },
+    )
+}
+
+pub fn run_repl_session(
+    mut node_spec: ReplCommandSpec,
+    reload: Option<ReloadCoordinator>,
+) -> anyhow::Result<ReplSessionResult> {
     let token = Uuid::new_v4().to_string();
     let control = control::ControlServer::start(token.clone())?;
 
@@ -71,7 +101,7 @@ pub fn run_repl_session(mut node_spec: ReplCommandSpec) -> anyhow::Result<ReplSe
     ));
 
     let terminal_guard = RawTerminalGuard::enter()?;
-    let mut supervisor = Supervisor::new(control, debug_log);
+    let mut supervisor = Supervisor::new(control, debug_log, reload);
     let result = supervisor.run(node_spec);
     drop(terminal_guard);
     result
@@ -86,12 +116,17 @@ struct Supervisor {
     node: Option<SessionRuntime>,
     cli: Option<SessionRuntime>,
     pending_cli_response: Option<Sender<control::RunCliResponse>>,
+    reload: Option<ReloadCoordinator>,
     cli_cancel_pending: bool,
     ctrl_c_debounced: bool,
 }
 
 impl Supervisor {
-    fn new(control: control::ControlServer, debug_log: DebugLog) -> Self {
+    fn new(
+        control: control::ControlServer,
+        debug_log: DebugLog,
+        reload: Option<ReloadCoordinator>,
+    ) -> Self {
         Self {
             control: Some(control),
             debug_log,
@@ -101,6 +136,7 @@ impl Supervisor {
             node: None,
             cli: None,
             pending_cli_response: None,
+            reload,
             cli_cancel_pending: false,
             ctrl_c_debounced: false,
         }
@@ -154,7 +190,7 @@ impl Supervisor {
                 self.handle_output(session, bytes);
                 Ok(None)
             }
-            SupervisorEvent::Exited { session, exit } => self.handle_exit(session, exit),
+            SupervisorEvent::Exited { session, exit } => self.handle_exit(session, exit, event_tx),
             SupervisorEvent::RunCli(request) => {
                 self.handle_run_cli(request, event_tx)?;
                 Ok(None)
@@ -169,7 +205,7 @@ impl Supervisor {
             | SupervisorState::CliActive
             | SupervisorState::CliCancelling
             | SupervisorState::CliExiting => self.cli.as_mut(),
-            SupervisorState::ShuttingDown => None,
+            SupervisorState::Reloading | SupervisorState::ShuttingDown => None,
         };
 
         if let Some(target) = target {
@@ -262,7 +298,7 @@ impl Supervisor {
             SupervisorState::CliCancelling | SupervisorState::CliExiting => {
                 self.ctrl_c_debounced = true;
             }
-            SupervisorState::ShuttingDown => {
+            SupervisorState::Reloading | SupervisorState::ShuttingDown => {
                 self.ctrl_c_debounced = true;
             }
         }
@@ -287,6 +323,7 @@ impl Supervisor {
         &mut self,
         session: SessionId,
         exit: CommandExit,
+        event_tx: &Sender<SupervisorEvent>,
     ) -> anyhow::Result<Option<ReplSessionResult>> {
         self.debug_log.log(format!(
             "session {:?} exited with {:?}",
@@ -297,6 +334,14 @@ impl Supervisor {
         match session {
             SessionId::Node => {
                 self.node = None;
+                if exit.code == Some(75)
+                    && let Some(node) = self.reload_node(event_tx)?
+                {
+                    self.node = Some(node);
+                    self.set_state(SupervisorState::NodeStarting);
+                    return Ok(None);
+                }
+
                 self.set_state(SupervisorState::ShuttingDown);
                 Ok(Some(ReplSessionResult { exit }))
             }
@@ -320,6 +365,34 @@ impl Supervisor {
                 Ok(None)
             }
         }
+    }
+
+    fn reload_node(
+        &mut self,
+        event_tx: &Sender<SupervisorEvent>,
+    ) -> anyhow::Result<Option<SessionRuntime>> {
+        let Some(request_tx) = self.reload.as_ref().map(|reload| reload.request_tx.clone()) else {
+            return Ok(None);
+        };
+
+        self.set_state(SupervisorState::Reloading);
+        self.refresh_terminal_mode()?;
+        self.debug_log
+            .log("requesting REPL reload from async runner");
+
+        let (response_tx, response_rx) = mpsc::channel();
+        request_tx
+            .send(ReloadRequest { response_tx })
+            .map_err(|_| anyhow!("Failed to request REPL reload"))?;
+
+        let node_spec = response_rx
+            .recv()
+            .map_err(|_| anyhow!("Failed to receive REPL reload result"))?
+            .map_err(|err| anyhow!(err))?;
+
+        self.debug_log.log("starting reloaded Node PTY backend");
+        self.spawn_session(SessionId::Node, node_spec, event_tx)
+            .map(Some)
     }
 
     fn tick(&mut self, _event_tx: &Sender<SupervisorEvent>) -> anyhow::Result<()> {
@@ -414,6 +487,7 @@ enum SupervisorState {
     CliActive,
     CliCancelling,
     CliExiting,
+    Reloading,
     ShuttingDown,
 }
 

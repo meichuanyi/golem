@@ -45,66 +45,68 @@ impl ControlServer {
 
     pub fn spawn_request_reader(self, event_tx: Sender<SupervisorEvent>) {
         thread::spawn(move || {
-            let Ok((stream, _)) = self.listener.accept() else {
-                return;
-            };
-            let Ok(mut writer) = stream.try_clone() else {
-                return;
-            };
-            let reader = BufReader::new(stream);
-
-            for line in reader.lines() {
-                let Ok(line) = line else {
+            loop {
+                let Ok((stream, _)) = self.listener.accept() else {
                     return;
                 };
-                let request = match serde_json::from_str::<ControlRequest>(&line) {
-                    Ok(request) => request,
-                    Err(err) => {
+                let Ok(mut writer) = stream.try_clone() else {
+                    return;
+                };
+                let reader = BufReader::new(stream);
+
+                for line in reader.lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    let request = match serde_json::from_str::<ControlRequest>(&line) {
+                        Ok(request) => request,
+                        Err(err) => {
+                            let _ = write_response(
+                                &mut writer,
+                                &ControlResponse::error(None, format!("invalid request: {err}")),
+                            );
+                            continue;
+                        }
+                    };
+
+                    if request.token != self.token {
                         let _ = write_response(
                             &mut writer,
-                            &ControlResponse::error(None, format!("invalid request: {err}")),
+                            &ControlResponse::error(Some(request.id), "invalid control token"),
                         );
                         continue;
                     }
-                };
 
-                if request.token != self.token {
-                    let _ = write_response(
-                        &mut writer,
-                        &ControlResponse::error(Some(request.id), "invalid control token"),
-                    );
-                    continue;
-                }
-
-                match request.kind.as_str() {
-                    "runCli" => {
-                        let (response_tx, response_rx) = mpsc::channel();
-                        if event_tx
-                            .send(SupervisorEvent::RunCli(RunCliSupervisorRequest {
-                                args: request.args,
-                                response: response_tx,
-                            }))
-                            .is_err()
-                        {
-                            return;
+                    match request.kind.as_str() {
+                        "runCli" => {
+                            let (response_tx, response_rx) = mpsc::channel();
+                            if event_tx
+                                .send(SupervisorEvent::RunCli(RunCliSupervisorRequest {
+                                    args: request.args,
+                                    response: response_tx,
+                                }))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let response = match response_rx.recv() {
+                                Ok(response) => ControlResponse::cli_result(request.id, response),
+                                Err(err) => ControlResponse::error(
+                                    Some(request.id),
+                                    format!("failed to receive CLI result: {err}"),
+                                ),
+                            };
+                            let _ = write_response(&mut writer, &response);
                         }
-                        let response = match response_rx.recv() {
-                            Ok(response) => ControlResponse::cli_result(request.id, response),
-                            Err(err) => ControlResponse::error(
-                                Some(request.id),
-                                format!("failed to receive CLI result: {err}"),
-                            ),
-                        };
-                        let _ = write_response(&mut writer, &response);
-                    }
-                    _ => {
-                        let _ = write_response(
-                            &mut writer,
-                            &ControlResponse::error(
-                                Some(request.id),
-                                format!("unknown request type: {}", request.kind),
-                            ),
-                        );
+                        _ => {
+                            let _ = write_response(
+                                &mut writer,
+                                &ControlResponse::error(
+                                    Some(request.id),
+                                    format!("unknown request type: {}", request.kind),
+                                ),
+                            );
+                        }
                     }
                 }
             }

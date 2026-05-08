@@ -19,7 +19,7 @@ use crate::app::context::BuildContext;
 use crate::bridge_gen::bridge_client_directory_name;
 use crate::command_handler::Handlers;
 use crate::command_handler::repl::load_repl_metadata;
-use crate::command_handler::repl::supervisor::{ReplCommandSpec, run_repl_session};
+use crate::command_handler::repl::supervisor::{ReplCommandSpec, reload_channel, run_repl_session};
 use crate::context::Context;
 use crate::log::{LogIndent, Output, log_action, log_skipping_up_to_date, logln, set_log_output};
 use crate::model::GuestLanguage;
@@ -97,26 +97,41 @@ impl TypeScriptRepl {
 
         logln("");
 
+        let command = self.prepare_command_spec(&args).await?;
+        let (reload_coordinator, mut reload_driver) = reload_channel();
+        let mut supervisor = tokio::task::spawn_blocking(move || {
+            run_repl_session(command, Some(reload_coordinator))
+        });
+
         loop {
-            let command = self.prepare_command_spec(&args).await?;
-            let result = tokio::task::spawn_blocking(move || run_repl_session(command)).await??;
-
-            if result.exit.code != Some(75) {
-                if result.exit.success {
-                    return Ok(());
+            tokio::select! {
+                result = &mut supervisor => {
+                    let result = result??;
+                    if result.exit.success {
+                        return Ok(());
+                    }
+                    anyhow::bail!(
+                        "Command failed with exit code: {}",
+                        result.exit.code.unwrap_or(1)
+                    );
                 }
-                anyhow::bail!(
-                    "Command failed with exit code: {}",
-                    result.exit.code.unwrap_or(1)
-                );
-            }
+                request = reload_driver.request_rx.recv() => {
+                    let Some(request) = request else {
+                        continue;
+                    };
 
-            {
                 logln("");
                 log_action("Reloading", "TypeScript REPL");
                 let _indent = LogIndent::new();
-                self.generate_repl_package(&args).await?;
-                logln("");
+                    let result = async {
+                        self.generate_repl_package(&args).await?;
+                        logln("");
+                        self.prepare_command_spec(&args).await
+                    }
+                    .await
+                    .map_err(|err: anyhow::Error| format!("{err:#}"));
+                    request.respond(result);
+                }
             }
         }
     }
