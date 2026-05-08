@@ -14,7 +14,7 @@
 
 use super::{CommandExit, ReplCommandSpec};
 use anyhow::Context;
-use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -24,6 +24,7 @@ pub struct PtyChild {
     pub writer: Box<dyn Write + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
     pub exit_receiver: Receiver<CommandExit>,
+    pub pair: PtyPair,
 }
 
 pub fn spawn_pty_command(spec: ReplCommandSpec) -> anyhow::Result<PtyChild> {
@@ -75,5 +76,6 @@ pub fn spawn_pty_command(spec: ReplCommandSpec) -> anyhow::Result<PtyChild> {
         writer,
         killer,
         exit_receiver: exit_rx,
+        pair,
     })
 }

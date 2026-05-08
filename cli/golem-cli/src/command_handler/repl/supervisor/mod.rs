@@ -372,6 +372,7 @@ impl Supervisor {
         Ok(SessionRuntime {
             writer: child.writer,
             killer: child.killer,
+            _pty_pair: child.pair,
             cancel_deadline: None,
         })
     }
@@ -424,6 +425,7 @@ enum TerminalState {
 struct SessionRuntime {
     writer: Box<dyn Write + Send>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    _pty_pair: portable_pty::PtyPair,
     cancel_deadline: Option<Instant>,
 }
 
