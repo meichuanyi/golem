@@ -174,6 +174,10 @@ export class CliReplInterop {
     return [completions, currentToken];
   }
 
+  async notifyReady(): Promise<void> {
+    await this.cli.notifyReady();
+  }
+
   static async exitWithReloadCode() {
     await flushStdIO();
     process.exit(75);
@@ -515,10 +519,14 @@ class GolemCli {
     const result = await this.run({ args: ['--format', 'json', ...opts.args], mode: 'collect' });
     return { ok: result.ok, code: result.code, json: JSON.parse(result.stdout) };
   }
+
+  async notifyReady(): Promise<void> {
+    await this.controlClient?.notifyReady();
+  }
 }
 
 type ControlResponse = {
-  type: 'cliResult' | 'error';
+  type: 'ok' | 'cliResult' | 'error';
   id?: string;
   ok: boolean;
   code?: number | null;
@@ -565,6 +573,13 @@ class RustReplControlClient {
       stdout: response.stdout ?? '',
       stderr: response.stderr ?? '',
     };
+  }
+
+  async notifyReady(): Promise<void> {
+    const response = await this.request({ type: 'replReady', args: [] });
+    if (response.type === 'error') {
+      throw new Error(response.error ?? 'REPL ready notification failed');
+    }
   }
 
   private async request(message: { type: string; args: string[] }): Promise<ControlResponse> {

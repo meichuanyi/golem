@@ -78,6 +78,12 @@ impl ControlServer {
                     }
 
                     match request.kind.as_str() {
+                        "replReady" => {
+                            if event_tx.send(SupervisorEvent::ReplReady).is_err() {
+                                return;
+                            }
+                            let _ = write_response(&mut writer, &ControlResponse::ok(request.id));
+                        }
                         "runCli" => {
                             let (response_tx, response_rx) = mpsc::channel();
                             if event_tx
@@ -151,6 +157,18 @@ struct ControlResponse {
 }
 
 impl ControlResponse {
+    fn ok(id: String) -> Self {
+        Self {
+            kind: "ok".to_string(),
+            id: Some(id),
+            ok: true,
+            code: None,
+            stdout: None,
+            stderr: None,
+            error: None,
+        }
+    }
+
     fn cli_result(id: String, result: RunCliResponse) -> Self {
         Self {
             kind: "cliResult".to_string(),

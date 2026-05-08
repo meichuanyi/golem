@@ -186,6 +186,10 @@ impl Supervisor {
                 self.handle_ctrl_c()?;
                 Ok(None)
             }
+            SupervisorEvent::ReplReady => {
+                self.handle_repl_ready()?;
+                Ok(None)
+            }
             SupervisorEvent::Output { session, bytes } => {
                 self.handle_output(session, bytes);
                 Ok(None)
@@ -200,12 +204,14 @@ impl Supervisor {
 
     fn handle_input(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
         let target = match self.state {
-            SupervisorState::ReplActive | SupervisorState::NodeStarting => self.node.as_mut(),
+            SupervisorState::ReplActive => self.node.as_mut(),
             SupervisorState::CliStarting
             | SupervisorState::CliActive
             | SupervisorState::CliCancelling
             | SupervisorState::CliExiting => self.cli.as_mut(),
-            SupervisorState::Reloading | SupervisorState::ShuttingDown => None,
+            SupervisorState::NodeStarting
+            | SupervisorState::Reloading
+            | SupervisorState::ShuttingDown => None,
         };
 
         if let Some(target) = target {
@@ -233,13 +239,19 @@ impl Supervisor {
             let _ = stdout.flush();
         }
 
-        if matches!(self.state, SupervisorState::NodeStarting) && session == SessionId::Node {
-            self.set_state(SupervisorState::ReplActive);
-        }
-
         if matches!(self.state, SupervisorState::CliStarting) && session == SessionId::Cli {
             self.set_state(SupervisorState::CliActive);
         }
+    }
+
+    fn handle_repl_ready(&mut self) -> anyhow::Result<()> {
+        self.debug_log
+            .log(format!("replReady in state {:?}", self.state));
+        if matches!(self.state, SupervisorState::NodeStarting) {
+            self.refresh_terminal_mode()?;
+            self.set_state(SupervisorState::ReplActive);
+        }
+        Ok(())
     }
 
     fn handle_run_cli(
@@ -398,8 +410,9 @@ impl Supervisor {
     fn tick(&mut self, _event_tx: &Sender<SupervisorEvent>) -> anyhow::Result<()> {
         match self.state {
             SupervisorState::NodeStarting => {
-                if self.state_since.elapsed() >= STARTUP_STABILIZATION_DELAY {
-                    self.set_state(SupervisorState::ReplActive);
+                if self.state_since.elapsed() >= Duration::from_secs(10) {
+                    self.debug_log
+                        .log("still waiting for replReady from Node backend");
                 }
             }
             SupervisorState::CliStarting => {
@@ -589,6 +602,7 @@ enum SessionId {
 enum SupervisorEvent {
     Input(Vec<u8>),
     CtrlC,
+    ReplReady,
     Output {
         session: SessionId,
         bytes: Vec<u8>,

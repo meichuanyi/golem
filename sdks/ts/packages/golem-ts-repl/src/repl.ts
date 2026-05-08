@@ -384,6 +384,7 @@ export class Repl {
     } else {
       this.showAgentTypeInfo(replServer, false);
       writeTestSyncEvent('repl_ready');
+      await this.cli.notifyReady();
     }
   }
 
