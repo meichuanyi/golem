@@ -14,31 +14,28 @@
 
 use golem_common::model::oplog::host_functions::{
     BlobstoreContainerClear, BlobstoreContainerDeleteObject, BlobstoreContainerDeleteObjects,
-    BlobstoreContainerGetData, BlobstoreContainerHasObject, BlobstoreContainerListObject,
-    BlobstoreContainerObjectInfo, BlobstoreContainerWriteData,
+    BlobstoreContainerGetData, BlobstoreContainerHasObject, BlobstoreContainerObjectInfo,
+    BlobstoreContainerWriteData,
 };
 use golem_common::model::oplog::{
     DurableFunctionType, HostRequestBlobStoreContainer, HostRequestBlobStoreContainerAndObject,
     HostRequestBlobStoreContainerAndObjects, HostRequestBlobStoreGetData,
     HostRequestBlobStoreWriteData, HostResponseBlobStoreContains, HostResponseBlobStoreGetData,
-    HostResponseBlobStoreListObjects, HostResponseBlobStoreObjectMetadata,
-    HostResponseBlobStoreUnit,
+    HostResponseBlobStoreObjectMetadata, HostResponseBlobStoreUnit,
 };
-use wasmtime::component::Resource;
+use wasmtime::component::{Resource, StreamReader};
 use wasmtime_wasi::IoView;
 
 use crate::durable_host::blobstore::classify_blob_store_error;
-use crate::durable_host::blobstore::types::{
-    ContainerEntry, IncomingValueEntry, OutgoingValueEntry, StreamObjectNamesEntry,
-};
+use crate::durable_host::blobstore::types::{ContainerEntry, IncomingValueEntry, OutgoingValueEntry};
 use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult};
 use crate::metrics::storage::{
     STORAGE_TYPE_BLOB_STORE, record_storage_bytes_written, record_storage_objects_deleted,
     record_storage_objects_written,
 };
 use crate::preview2::wasi::blobstore::container::{
-    Container, ContainerMetadata, Error, Host, HostContainer, HostStreamObjectNames, IncomingValue,
-    ObjectMetadata, ObjectName, OutgoingValue, StreamObjectNames,
+    Container, ContainerMetadata, Error, Host, HostContainer, IncomingValue, ObjectMetadata,
+    ObjectName, OutgoingValue,
 };
 use crate::workerctx::WorkerCtx;
 
@@ -222,60 +219,10 @@ impl<Ctx: WorkerCtx> HostContainer for DurableWorkerCtx<Ctx> {
 
     async fn list_objects(
         &mut self,
-        container: Resource<Container>,
-    ) -> anyhow::Result<Result<Resource<StreamObjectNames>, Error>> {
-        let mut durability =
-            Durability::<BlobstoreContainerListObject>::new(self, DurableFunctionType::ReadRemote)
-                .await?;
-
-        let environment_id = self.state.owned_agent_id.environment_id();
-        let container_name = self
-            .as_wasi_view()
-            .table()
-            .get::<ContainerEntry>(&container)
-            .map(|container_entry| container_entry.name.clone())?;
-
-        let result = if durability.is_live() {
-            let result = loop {
-                let result = self
-                    .state
-                    .blob_store_service
-                    .list_objects(environment_id, container_name.clone())
-                    .await;
-                match durability
-                    .try_trigger_retry_or_loop(self, &result, classify_blob_store_error)
-                    .await?
-                {
-                    InternalRetryResult::Persist => break result,
-                    InternalRetryResult::RetryInternally => continue,
-                }
-            };
-            let result = HostResponseBlobStoreListObjects {
-                result: result.map_err(|err| err.to_string()),
-            };
-            durability
-                .persist(
-                    self,
-                    HostRequestBlobStoreContainer {
-                        container: container_name,
-                    },
-                    result,
-                )
-                .await
-        } else {
-            durability.replay(self).await
-        }?;
-
-        match result.result {
-            Ok(list_objects) => {
-                let stream_object_names = self
-                    .as_wasi_view()
-                    .table()
-                    .push(StreamObjectNamesEntry::new(list_objects))?;
-                Ok(Ok(stream_object_names))
-            }
-            Err(err) => Ok(Err(err)),
-        }
+        _container: Resource<Container>,
+    ) -> anyhow::Result<Result<StreamReader<ObjectName>, Error>> {
+        self.observe_function_call("blobstore::container::container", "list_objects");
+        unimplemented!("list_objects is not yet implemented for WASI p3 streams")
     }
 
     async fn delete_object(
@@ -587,66 +534,6 @@ impl<Ctx: WorkerCtx> HostContainer for DurableWorkerCtx<Ctx> {
         self.as_wasi_view()
             .table()
             .delete::<ContainerEntry>(container)?;
-        Ok(())
-    }
-}
-
-impl<Ctx: WorkerCtx> HostStreamObjectNames for DurableWorkerCtx<Ctx> {
-    async fn read_stream_object_names(
-        &mut self,
-        self_: Resource<StreamObjectNames>,
-        len: u64,
-    ) -> anyhow::Result<Result<(Vec<ObjectName>, bool), Error>> {
-        self.observe_function_call(
-            "blobstore::container::stream_object_names",
-            "read_stream_object_names",
-        );
-        let names = self
-            .as_wasi_view()
-            .table()
-            .get::<StreamObjectNamesEntry>(&self_)
-            .map(|stream_object_names_entry| stream_object_names_entry.names.clone())?;
-        let mut names = names.write().unwrap();
-        let mut result = Vec::new();
-        for _ in 0..len {
-            if let Some(name) = names.pop() {
-                result.push(name);
-            } else {
-                return Ok(Ok((result, true)));
-            }
-        }
-        Ok(Ok((result, false)))
-    }
-
-    async fn skip_stream_object_names(
-        &mut self,
-        self_: Resource<StreamObjectNames>,
-        num: u64,
-    ) -> anyhow::Result<Result<(u64, bool), Error>> {
-        self.observe_function_call(
-            "blobstore::container::stream_object_names",
-            "skip_stream_object_names",
-        );
-        let names = self
-            .as_wasi_view()
-            .table()
-            .get(&self_)
-            .map(|stream_object_names_entry| stream_object_names_entry.names.clone())?;
-        let mut names = names.write().unwrap();
-        let mut result = 0;
-        for _ in 0..num {
-            if names.pop().is_some() {
-                result += 1;
-            } else {
-                return Ok(Ok((result, true)));
-            }
-        }
-        Ok(Ok((result, false)))
-    }
-
-    async fn drop(&mut self, rep: Resource<StreamObjectNames>) -> anyhow::Result<()> {
-        self.observe_function_call("blobstore::container::stream_object_names", "drop");
-        self.as_wasi_view().table().delete(rep)?;
         Ok(())
     }
 }

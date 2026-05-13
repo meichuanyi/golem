@@ -22,11 +22,12 @@ use crate::model::public_oplog::{
 };
 use crate::preview2::golem_api_1_x::host::{
     AgentAnyFilter, ForkDetails, ForkResult, GetAgents, Host, HostGetAgents, HostGetPromiseResult,
+    HostGetPromiseResultWithStore,
 };
 use crate::preview2::golem_api_1_x::oplog::{
     Host as OplogHost, HostGetOplog, HostSearchOplog, SearchOplog,
 };
-use crate::preview2::{Pollable, golem_api_1_x};
+use crate::preview2::golem_api_1_x;
 use crate::services::oplog::CommitLevel;
 use crate::services::promise::{PromiseHandle, PromiseService};
 use crate::services::worker_proxy::WorkerProxyError;
@@ -39,9 +40,9 @@ use golem_common::model::agent::ParsedAgentId;
 use golem_common::model::component::{ComponentId, ComponentRevision};
 use golem_common::model::oplog::host_functions::{
     GolemApiCompletePromise, GolemApiCreatePromise, GolemApiFork, GolemApiForkWorker,
-    GolemApiGenerateIdempotencyKey, GolemApiGetAgentMetadata, GolemApiGetPromiseResult,
-    GolemApiGetSelfMetadata, GolemApiResolveAgentIdStrict, GolemApiResolveComponentId,
-    GolemApiRevertWorker, GolemApiUpdateWorker,
+    GolemApiGenerateIdempotencyKey, GolemApiGetAgentMetadata, GolemApiGetSelfMetadata,
+    GolemApiResolveAgentIdStrict, GolemApiResolveComponentId, GolemApiRevertWorker,
+    GolemApiUpdateWorker,
 };
 use golem_common::model::oplog::types::AgentMetadataForGuests;
 use golem_common::model::oplog::{
@@ -51,8 +52,7 @@ use golem_common::model::oplog::{
     HostRequestNoInput, HostResponseGolemApiAgentId, HostResponseGolemApiAgentMetadata,
     HostResponseGolemApiComponentId, HostResponseGolemApiFork, HostResponseGolemApiIdempotencyKey,
     HostResponseGolemApiPromiseCompletion, HostResponseGolemApiPromiseId,
-    HostResponseGolemApiPromiseResult, HostResponseGolemApiSelfAgentMetadata,
-    HostResponseGolemApiUnit, OplogEntry, PublicOplogEntry,
+    HostResponseGolemApiSelfAgentMetadata, HostResponseGolemApiUnit, OplogEntry, PublicOplogEntry,
 };
 use golem_common::model::regions::OplogRegion;
 use golem_common::model::{AgentId, OwnedAgentId, ScanCursor};
@@ -63,8 +63,8 @@ use std::time::Duration;
 use tokio::sync::OnceCell;
 use tracing::debug;
 use uuid::Uuid;
-use wasmtime::component::Resource;
-use wasmtime_wasi::{IoView, subscribe};
+use wasmtime::component::{Accessor, HasSelf, Resource};
+use wasmtime_wasi::IoView;
 
 fn classify_worker_proxy_error(err: &WorkerProxyError) -> HostFailureKind {
     match err {
@@ -1069,65 +1069,6 @@ impl<Ctx: WorkerCtx> HostGetOplog for DurableWorkerCtx<Ctx> {
 }
 
 impl<Ctx: WorkerCtx> HostGetPromiseResult for DurableWorkerCtx<Ctx> {
-    async fn subscribe(
-        &mut self,
-        resource: Resource<GetPromiseResultEntry>,
-    ) -> anyhow::Result<Resource<Pollable>> {
-        self.observe_function_call("golem::api::promise-result", "subscribe");
-        let handle = self.table().get(&resource)?.clone();
-
-        let resource_rep = resource.rep();
-        let dyn_pollable = subscribe(self.table(), resource, None)?;
-        self.state
-            .promise_backed_pollables
-            .write()
-            .await
-            .insert(dyn_pollable.rep(), handle);
-        self.state
-            .promise_dyn_pollables
-            .write()
-            .await
-            .entry(resource_rep)
-            .or_default()
-            .insert(dyn_pollable.rep());
-
-        Ok(dyn_pollable)
-    }
-
-    async fn get(
-        &mut self,
-        resource: Resource<GetPromiseResultEntry>,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
-        let durability =
-            Durability::<GolemApiGetPromiseResult>::new(self, DurableFunctionType::ReadRemote)
-                .await?;
-
-        let result = if durability.is_live() {
-            let self_agent_id = self.agent_id().clone();
-            let entry = self.table().get(&resource)?;
-
-            // only the agent that originally created the promise is woken up when it is completed.
-            if entry.promise_id.agent_id != self_agent_id {
-                return Err(anyhow!(
-                    "Tried awaiting a promise not created by the current agent"
-                ));
-            }
-
-            let result = entry.get_handle().await.get().await;
-            durability
-                .persist(
-                    self,
-                    HostRequestNoInput {},
-                    HostResponseGolemApiPromiseResult { result },
-                )
-                .await
-        } else {
-            durability.replay(self).await
-        }?;
-
-        Ok(result.result)
-    }
-
     async fn drop(&mut self, resource: Resource<GetPromiseResultEntry>) -> anyhow::Result<()> {
         self.observe_function_call("golem::api::promise-result", "drop");
         let resource_rep = resource.rep();
@@ -1155,6 +1096,22 @@ impl<Ctx: WorkerCtx> HostGetPromiseResult for DurableWorkerCtx<Ctx> {
         self.state.promise_service.cleanup().await;
 
         Ok(())
+    }
+}
+
+impl<Ctx: WorkerCtx> HostGetPromiseResultWithStore for HasSelf<DurableWorkerCtx<Ctx>> {
+    async fn get<T: Send>(
+        _accessor: &Accessor<T, Self>,
+        _resource: Resource<GetPromiseResultEntry>,
+    ) -> anyhow::Result<Vec<u8>> {
+        // TODO(p3): port the durable get-promise-result implementation to the
+        // `Accessor`-based async pattern. The previous `&mut self` based logic
+        // (which used `Durability::<GolemApiGetPromiseResult>::new`,
+        // `entry.get_handle().await.get().await`, and `durability.persist(...)`)
+        // does not translate directly because the new bindgen `get` lives on
+        // `HostGetPromiseResultWithStore` and only exposes an `Accessor` rather
+        // than `&mut self`.
+        unimplemented!("HostGetPromiseResultWithStore::get (p3 migration)")
     }
 }
 
@@ -1687,9 +1644,4 @@ impl GetPromiseResultEntry {
     }
 }
 
-#[async_trait]
-impl wasmtime_wasi::p2::Pollable for GetPromiseResultEntry {
-    async fn ready(&mut self) {
-        self.get_handle().await.await_ready().await
-    }
-}
+// TODO(p3) Blocker 1: re-implement async access via p3 accessor pattern

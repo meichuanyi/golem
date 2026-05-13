@@ -1005,19 +1005,9 @@ impl Display for InterruptKind {
 
 impl Error for InterruptKind {}
 
-#[cfg(feature = "worker-executor")]
-mod service {
-    use super::WorkerExecutorError;
-
-    impl From<WorkerExecutorError> for wasmtime_wasi::p2::StreamError {
-        fn from(value: WorkerExecutorError) -> Self {
-            Self::Trap(wasmtime::Error::msg(value.to_string()))
-        }
-    }
-
-    impl From<WorkerExecutorError> for wasmtime_wasi::p2::SocketError {
-        fn from(value: WorkerExecutorError) -> Self {
-            Self::trap(value)
-        }
-    }
-}
+// TODO(p3) Blocker 3: the `From<WorkerExecutorError> for wasmtime_wasi::p2::StreamError`
+// and `for wasmtime_wasi::p2::SocketError` impls were removed during the p2 -> p3
+// migration. They were used by the old durable wrappers under
+// `golem-worker-executor/src/durable_host/{io,sockets}/` (now deleted). Restore
+// p3-native equivalents (`wasmtime_wasi::p3::*` error types or whatever the
+// re-implemented durable wrappers need) when WASI durability is rebuilt.
