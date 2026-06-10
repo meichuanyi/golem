@@ -481,7 +481,6 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                 file_loader,
                 worker_config.created_by,
                 worker_config.created_by_email,
-                worker_config.agent_initial_card,
                 worker_config.initial_agent_config,
                 agent_config,
                 shard_service,
@@ -593,13 +592,44 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
         &self.state.created_by_email
     }
 
-    pub fn agent_initial_card(&self) -> &golem_common::model::card::Card {
-        &self.state.agent_initial_card
-    }
-
     pub fn agent_effective_surface(&self) -> golem_common::model::card::EffectiveSurface {
+        let Some(agent_id) = &self.state.agent_id else {
+            return golem_common::model::card::EffectiveSurface::default();
+        };
+
+        let component = &self.state.component_metadata;
+        let template = component
+            .metadata
+            .agent_type_initial_permission_template(&agent_id.agent_type)
+            .cloned()
+            .unwrap_or_else(|| {
+                golem_common::model::component_metadata::AgentInitialPermissionTemplate::default_for(
+                    &component.environment_name,
+                    &component.component_name,
+                )
+            });
+
+        let context = golem_common::model::card::AgentPermissionMonomorphizationContext {
+            account: component.account_email.clone(),
+            application: component.application_name.clone(),
+            environment: component.environment_name.clone(),
+            component: component.component_name.clone(),
+            agent_name: self.owned_agent_id.agent_id.agent_id.clone(),
+            agent_type: agent_id.agent_type.clone(),
+        };
+
+        let Ok(card) = golem_common::model::card::monomorphize_agent_initial_card(
+            &template.lower_positive,
+            &template.lower_negative,
+            &template.upper_positive,
+            &template.upper_negative,
+            &context,
+        ) else {
+            return golem_common::model::card::EffectiveSurface::default();
+        };
+
         golem_common::model::card::EffectiveSurface::from_cards(
-            std::slice::from_ref(&self.state.agent_initial_card),
+            std::slice::from_ref(&card),
             &golem_common::model::card::recipient::RecipientPattern::Any,
         )
         .unwrap_or_default()
@@ -4112,7 +4142,6 @@ struct PrivateDurableWorkerState {
     created_by: AccountId,
     agent_id: Option<LegacyParsedAgentId>,
     created_by_email: AccountEmail,
-    agent_initial_card: golem_common::model::card::Card,
     current_idempotency_key: Option<IdempotencyKey>,
     rpc: Arc<dyn Rpc>,
     worker_proxy: Arc<dyn WorkerProxy>,
@@ -4288,7 +4317,6 @@ impl PrivateDurableWorkerState {
         file_loader: Arc<FileLoader>,
         created_by: AccountId,
         created_by_email: AccountEmail,
-        agent_initial_card: golem_common::model::card::Card,
         initial_agent_config: Vec<TypedAgentConfigEntry>,
         agent_config: HashMap<Vec<String>, golem_wasm::ValueAndType>,
         shard_service: Arc<dyn ShardService>,
@@ -4367,7 +4395,6 @@ impl PrivateDurableWorkerState {
             file_loader,
             created_by,
             created_by_email,
-            agent_initial_card,
             initial_agent_config,
             config,
             cached_agent_config_retry_policies: None,

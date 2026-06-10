@@ -32,7 +32,7 @@ use golem_common::model::account::{AccountEmail, AccountId};
 use golem_common::model::agent::{
     AgentMethod, AgentType, DataSchema, LegacyParsedAgentId, UntypedDataValue,
 };
-use golem_common::model::card::Card;
+use golem_common::model::card::EffectiveSurface;
 use golem_common::model::environment::EnvironmentId;
 use golem_common::model::invocation_context::InvocationContextStack;
 use golem_common::model::invocation_context::{AttributeValue, InvocationContextSpan, SpanId};
@@ -267,7 +267,7 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
                     let rpc = self.rpc();
                     let created_by = self.created_by();
                     let created_by_email = self.created_by_email().clone();
-                    let initial_card = self.agent_initial_card().clone();
+                    let effective_surface = self.agent_effective_surface();
                     let agent_id = self.agent_id().clone();
 
                     let either_result = futures::future::select(
@@ -278,7 +278,7 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
                             input_untyped.clone(),
                             created_by,
                             &created_by_email,
-                            &initial_card,
+                            &effective_surface,
                             &agent_id,
                             &env,
                             stack,
@@ -450,6 +450,7 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
             let retry_properties = RetryContext::rpc("invoke", &remote_agent_id, &method_name);
             let result = loop {
                 let stack = self.clone_as_inherited_stack(span.span_id());
+                let effective_surface = self.agent_effective_surface();
                 let result = self
                     .rpc()
                     .invoke(
@@ -459,7 +460,7 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
                         input_untyped.clone(),
                         self.created_by(),
                         self.created_by_email(),
-                        self.agent_initial_card(),
+                        &effective_surface,
                         self.agent_id(),
                         &env,
                         stack,
@@ -642,7 +643,7 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
                 output_schema.clone(),
                 created_by,
                 created_by_email,
-                self.agent_initial_card().clone(),
+                self.agent_effective_surface(),
                 agent_id,
                 env,
                 stack,
@@ -661,14 +662,14 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
             })?;
             Ok(fut)
         } else {
-            let self_initial_card = self.agent_initial_card().clone();
+            let self_effective_surface = self.agent_effective_surface();
             let fut = self.table().push(FutureInvokeResultEntry {
                 payload: Box::new(FutureInvokeResultState::Deferred {
                     remote_agent_id,
                     self_agent_id: agent_id,
                     self_created_by: created_by,
                     self_created_by_email: created_by_email,
-                    self_initial_card,
+                    self_effective_surface,
                     env,
                     method_name,
                     method_parameters: input_typed,
@@ -1379,13 +1380,14 @@ pub async fn construct_wasm_rpc_resource<Ctx: WorkerCtx>(
         .await?;
     let target_environment_id = target_component.environment_id;
     let remote_agent_id = OwnedAgentId::new(target_environment_id, &remote_agent_id);
+    let effective_surface = ctx.agent_effective_surface();
     let demand = ctx
         .rpc()
         .create_demand(
             &remote_agent_id,
             ctx.created_by(),
             ctx.created_by_email(),
-            ctx.agent_initial_card(),
+            &effective_surface,
             ctx.agent_id(),
             env,
             stack,
@@ -1464,7 +1466,7 @@ fn spawn_rpc_task_with_retry<Ctx: WorkerCtx>(
     output_schema: DataSchema,
     created_by: AccountId,
     created_by_email: AccountEmail,
-    initial_card: Card,
+    effective_surface: EffectiveSurface,
     agent_id: AgentId,
     env: Vec<(String, String)>,
     stack: InvocationContextStack,
@@ -1479,7 +1481,7 @@ fn spawn_rpc_task_with_retry<Ctx: WorkerCtx>(
         let output_schema = output_schema.clone();
         let created_by = created_by;
         let created_by_email = created_by_email.clone();
-        let initial_card = initial_card.clone();
+        let effective_surface = effective_surface.clone();
         let agent_id = agent_id.clone();
         let env = env.clone();
         let stack = stack.clone();
@@ -1498,7 +1500,7 @@ fn spawn_rpc_task_with_retry<Ctx: WorkerCtx>(
                     input_untyped,
                     created_by,
                     &created_by_email,
-                    &initial_card,
+                    &effective_surface,
                     &agent_id,
                     &env,
                     stack,
@@ -1691,7 +1693,7 @@ fn handle_deferred_rpc_dispatch<Ctx: WorkerCtx>(
         self_agent_id,
         self_created_by,
         self_created_by_email,
-        self_initial_card,
+        self_effective_surface,
         env,
         method_name,
         method_parameters,
@@ -1748,7 +1750,7 @@ fn handle_deferred_rpc_dispatch<Ctx: WorkerCtx>(
         output_schema.clone(),
         *self_created_by,
         self_created_by_email.clone(),
-        self_initial_card.clone(),
+        self_effective_surface.clone(),
         self_agent_id.clone(),
         env.clone(),
         stack,
@@ -1975,7 +1977,7 @@ enum FutureInvokeResultState {
         self_agent_id: AgentId,
         self_created_by: AccountId,
         self_created_by_email: AccountEmail,
-        self_initial_card: Card,
+        self_effective_surface: EffectiveSurface,
         env: Vec<(String, String)>,
         method_name: String,
         method_parameters: TypedRpcInput,

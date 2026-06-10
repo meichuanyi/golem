@@ -2187,7 +2187,6 @@ impl TryFrom<PublicOplogEntry> for OplogEntry {
                     .map(|p| p.environment_plugin_grant_id)
                     .collect(),
                 original_phantom_id: create.original_phantom_id,
-                agent_initial_card: Vec::new(),
                 instance_id: create.instance_id
             }),
             PublicOplogEntry::HostCall(host_call) => {
@@ -2866,7 +2865,6 @@ impl TryFrom<OplogEntry> for golem_api_grpc::proto::golem::worker::RawOplogEntry
                 initial_active_plugins,
                 local_agent_config,
                 original_phantom_id,
-                agent_initial_card,
                 instance_id,
                 ..
             } => Entry::Create(RawCreateParameters {
@@ -2893,7 +2891,7 @@ impl TryFrom<OplogEntry> for golem_api_grpc::proto::golem::worker::RawOplogEntry
                     .collect::<Result<Vec<_>, _>>()?,
                 original_phantom_id: original_phantom_id.map(Into::into),
                 instance_id: Some(instance_id.into()),
-                agent_initial_card,
+                agent_initial_card: Vec::new(),
             }),
             OplogEntry::HostCall {
                 function_name,
@@ -3229,7 +3227,6 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::RawOplogEntry> for OplogEntry
                     uuid::Uuid::from(proto_uuid)
                 });
                 let instance_id = p.instance_id.ok_or("Missing instance_id")?.into();
-                let agent_initial_card = p.agent_initial_card;
 
                 Ok(OplogEntry::Create {
                     timestamp,
@@ -3245,7 +3242,6 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::RawOplogEntry> for OplogEntry
                     initial_active_plugins,
                     local_agent_config,
                     original_phantom_id,
-                    agent_initial_card,
                     instance_id,
                 })
             }
