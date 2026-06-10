@@ -481,6 +481,7 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                 file_loader,
                 worker_config.created_by,
                 worker_config.created_by_email,
+                worker_config.agent_initial_card,
                 worker_config.initial_agent_config,
                 agent_config,
                 shard_service,
@@ -590,6 +591,18 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
 
     pub fn created_by_email(&self) -> &AccountEmail {
         &self.state.created_by_email
+    }
+
+    pub fn agent_initial_card(&self) -> &golem_common::model::card::Card {
+        &self.state.agent_initial_card
+    }
+
+    pub fn agent_effective_surface(&self) -> golem_common::model::card::EffectiveSurface {
+        golem_common::model::card::EffectiveSurface::from_cards(
+            std::slice::from_ref(&self.state.agent_initial_card),
+            &golem_common::model::card::recipient::RecipientPattern::Any,
+        )
+        .unwrap_or_default()
     }
 
     pub fn parsed_agent_id(&self) -> Option<LegacyParsedAgentId> {
@@ -4099,6 +4112,7 @@ struct PrivateDurableWorkerState {
     created_by: AccountId,
     agent_id: Option<LegacyParsedAgentId>,
     created_by_email: AccountEmail,
+    agent_initial_card: golem_common::model::card::Card,
     current_idempotency_key: Option<IdempotencyKey>,
     rpc: Arc<dyn Rpc>,
     worker_proxy: Arc<dyn WorkerProxy>,
@@ -4274,6 +4288,7 @@ impl PrivateDurableWorkerState {
         file_loader: Arc<FileLoader>,
         created_by: AccountId,
         created_by_email: AccountEmail,
+        agent_initial_card: golem_common::model::card::Card,
         initial_agent_config: Vec<TypedAgentConfigEntry>,
         agent_config: HashMap<Vec<String>, golem_wasm::ValueAndType>,
         shard_service: Arc<dyn ShardService>,
@@ -4352,6 +4367,7 @@ impl PrivateDurableWorkerState {
             file_loader,
             created_by,
             created_by_email,
+            agent_initial_card,
             initial_agent_config,
             config,
             cached_agent_config_retry_policies: None,

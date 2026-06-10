@@ -540,6 +540,7 @@ impl<Ctx: WorkerCtx> DefaultWorkerFork<Ctx> {
             original_phantom_id: initial_source_worker_metadata.original_phantom_id,
             fingerprint: AgentFingerprint(instance_id),
             agent_mode: source_worker_instance.agent_mode(),
+            agent_initial_card: initial_source_worker_metadata.agent_initial_card,
         };
 
         let source_oplog = source_worker_instance.oplog();
@@ -681,6 +682,7 @@ impl<Ctx: WorkerCtx> DefaultWorkerFork<Ctx> {
                 local_agent_config,
                 agent_id: _,
                 original_phantom_id,
+                agent_initial_card,
                 ..
             } => Some(OplogEntry::Create {
                 timestamp,
@@ -696,6 +698,7 @@ impl<Ctx: WorkerCtx> DefaultWorkerFork<Ctx> {
                 initial_active_plugins,
                 local_agent_config,
                 original_phantom_id,
+                agent_initial_card,
                 instance_id,
             }),
             _ => None,
